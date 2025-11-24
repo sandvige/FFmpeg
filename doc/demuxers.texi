@@ -1047,6 +1047,74 @@ the command:
 ffplay -f rawvideo -pixel_format rgb24 -video_size 320x240 -framerate 10 input.raw
 @end example
 
+@section rawvideo_ts
+
+Raw video with timestamp demuxer.
+
+This demuxer reads raw video streams where each frame is prefixed by a 64-bit
+timestamp in microseconds. This format is designed for Variable Frame Rate (VFR)
+content, where the timestamp of each frame is embedded in the stream itself,
+eliminating the need for frame duplication at a constant frame rate.
+
+The format works with non-seekable streams (e.g., @code{pipe:0}).
+
+@subsection Binary Format
+
+Each frame in the stream consists of:
+@itemize
+@item
+A 64-bit unsigned little-endian integer representing the presentation timestamp
+in microseconds (PTS).
+@item
+Raw frame data of a fixed size determined by the video parameters.
+@end itemize
+
+@subsection Options
+
+This demuxer accepts the following options:
+
+@table @option
+@item pixel_format
+Set the input video pixel format. Default value is @code{yuv420p}.
+
+@item video_size
+Set the input video size. This value must be specified explicitly.
+
+@item framerate
+Set the input video frame rate. This is used only for estimating the duration
+of the first frame. Default value is 25. For VFR content, the actual frame
+durations are calculated from the timestamp differences.
+@end table
+
+@subsection Behavior
+
+@itemize
+@item
+The time base is set to 1/1000000 (microseconds).
+@item
+Each packet's PTS and DTS are set to the timestamp read from the stream.
+@item
+Frame durations are calculated as the difference between consecutive timestamps,
+providing accurate VFR support.
+@item
+Non-monotonic timestamps (where a frame's timestamp is earlier than the previous
+frame's timestamp) are rejected with an error.
+@end itemize
+
+@subsection Examples
+
+Read a raw RGBA video stream with timestamps from stdin and encode to H.264:
+@example
+ffmpeg -f rawvideo_ts -video_size 1280x720 -pixel_format rgba -i pipe:0 \
+  -vsync vfr -c:v libx264 output.mp4
+@end example
+
+Process a raw YUV420p video file with timestamps:
+@example
+ffmpeg -f rawvideo_ts -video_size 640x480 -pixel_format yuv420p -i input.rvts \
+  -c:v libx265 output.mp4
+@end example
+
 @anchor{rcwtdec}
 @section rcwt
 
