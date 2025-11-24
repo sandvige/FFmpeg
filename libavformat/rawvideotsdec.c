@@ -78,8 +78,12 @@ static int rawvideots_read_header(AVFormatContext *ctx)
     if (s->packet_size == 0)
         return AVERROR(EINVAL);
 
-    st->codecpar->bit_rate = av_rescale_q(s->packet_size,
-                                       (AVRational){8,1}, st->time_base);
+    /* Calculate bit rate based on frame size and framerate */
+    if (s->framerate.num > 0 && s->framerate.den > 0) {
+        st->codecpar->bit_rate = av_rescale_q(s->packet_size,
+                                           (AVRational){8 * s->framerate.num, s->framerate.den},
+                                           (AVRational){1, 1});
+    }
 
     s->prev_pkt = NULL;
     s->prev_pts = AV_NOPTS_VALUE;
@@ -106,7 +110,8 @@ static int rawvideots_read_packet(AVFormatContext *ctx, AVPacket *pkt)
             if (s->framerate.num > 0 && s->framerate.den > 0) {
                 pkt->duration = av_rescale_q(1, av_inv_q(s->framerate), (AVRational){1, 1000000});
             }
-            return ret;
+            /* Return success with buffered packet, not the error */
+            return 0;
         }
         if (ret < 8) {
             /* EOF - return buffered packet with estimated duration */
@@ -224,6 +229,7 @@ static const AVClass rawvideots_demuxer_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
+#if CONFIG_RAWVIDEO_TS_DEMUXER
 const FFInputFormat ff_rawvideo_ts_demuxer = {
     .p.name         = "rawvideo_ts",
     .p.long_name    = NULL_IF_CONFIG_SMALL("raw video with timestamps"),
@@ -236,3 +242,4 @@ const FFInputFormat ff_rawvideo_ts_demuxer = {
     .read_close     = rawvideots_read_close,
     .raw_codec_id   = AV_CODEC_ID_RAWVIDEO,
 };
+#endif // CONFIG_RAWVIDEO_TS_DEMUXER
