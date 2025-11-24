@@ -36,8 +36,8 @@ typedef struct RawVideoTSDemuxerContext {
     char *pixel_format;       /**< Set by a private option. */
     AVRational framerate;     /**< AVRational describing framerate, set by a private option. */
     int packet_size;          /**< Size of a single video frame in bytes */
+    AVPacket *prev_pkt;       /**< Buffered previous packet for duration calculation */
     int64_t prev_pts;         /**< Previous frame PTS for duration calculation */
-    int first_packet;         /**< Flag to track first packet */
 } RawVideoTSDemuxerContext;
 
 static int rawvideots_read_header(AVFormatContext *ctx)
@@ -81,8 +81,8 @@ static int rawvideots_read_header(AVFormatContext *ctx)
     st->codecpar->bit_rate = av_rescale_q(s->packet_size,
                                        (AVRational){8,1}, st->time_base);
 
+    s->prev_pkt = NULL;
     s->prev_pts = AV_NOPTS_VALUE;
-    s->first_packet = 1;
 
     return 0;
 }
@@ -93,8 +93,77 @@ static int rawvideots_read_packet(AVFormatContext *ctx, AVPacket *pkt)
     uint8_t ts_buf[8];
     int64_t pts_us;
     int ret;
+    AVPacket *tmp_pkt;
 
-    /* Read 8-byte timestamp (uint64_le) */
+    /* If we have a buffered packet from the previous call, return it now */
+    if (s->prev_pkt) {
+        /* Read the next timestamp to calculate duration for the buffered packet */
+        ret = avio_read(ctx->pb, ts_buf, 8);
+        if (ret < 0) {
+            /* Error reading next timestamp, return buffered packet with estimated duration */
+            av_packet_move_ref(pkt, s->prev_pkt);
+            av_packet_free(&s->prev_pkt);
+            if (s->framerate.num > 0 && s->framerate.den > 0) {
+                pkt->duration = av_rescale_q(1, av_inv_q(s->framerate), (AVRational){1, 1000000});
+            }
+            return ret;
+        }
+        if (ret < 8) {
+            /* EOF - return buffered packet with estimated duration */
+            av_packet_move_ref(pkt, s->prev_pkt);
+            av_packet_free(&s->prev_pkt);
+            if (s->framerate.num > 0 && s->framerate.den > 0) {
+                pkt->duration = av_rescale_q(1, av_inv_q(s->framerate), (AVRational){1, 1000000});
+            }
+            return 0;
+        }
+
+        pts_us = AV_RL64(ts_buf);
+
+        /* Check for non-monotonic PTS */
+        if (pts_us < s->prev_pts) {
+            av_log(ctx, AV_LOG_ERROR, "Non-monotonic PTS detected: previous=%"PRId64" current=%"PRId64"\n",
+                   s->prev_pts, pts_us);
+            av_packet_free(&s->prev_pkt);
+            return AVERROR_INVALIDDATA;
+        }
+
+        /* Set duration for buffered packet */
+        s->prev_pkt->duration = pts_us - s->prev_pts;
+
+        /* Return the buffered packet */
+        av_packet_move_ref(pkt, s->prev_pkt);
+
+        /* Allocate new packet for current frame */
+        tmp_pkt = av_packet_alloc();
+        if (!tmp_pkt)
+            return AVERROR(ENOMEM);
+
+        /* Read current frame data */
+        ret = av_get_packet(ctx->pb, tmp_pkt, s->packet_size);
+        if (ret < 0) {
+            av_packet_free(&tmp_pkt);
+            return ret;
+        }
+        if (ret < s->packet_size) {
+            av_log(ctx, AV_LOG_ERROR, "Incomplete frame: expected %d bytes, got %d\n",
+                   s->packet_size, ret);
+            av_packet_free(&tmp_pkt);
+            return AVERROR_EOF;
+        }
+
+        tmp_pkt->pts = pts_us;
+        tmp_pkt->dts = pts_us;
+        tmp_pkt->stream_index = 0;
+
+        /* Store this packet for next call */
+        s->prev_pkt = tmp_pkt;
+        s->prev_pts = pts_us;
+
+        return 0;
+    }
+
+    /* First packet - just read and buffer it */
     ret = avio_read(ctx->pb, ts_buf, 8);
     if (ret < 0)
         return ret;
@@ -103,42 +172,39 @@ static int rawvideots_read_packet(AVFormatContext *ctx, AVPacket *pkt)
 
     pts_us = AV_RL64(ts_buf);
 
-    /* Check for non-monotonic PTS */
-    if (s->prev_pts != AV_NOPTS_VALUE && pts_us < s->prev_pts) {
-        av_log(ctx, AV_LOG_ERROR, "Non-monotonic PTS detected: previous=%"PRId64" current=%"PRId64"\n",
-               s->prev_pts, pts_us);
-        return AVERROR_INVALIDDATA;
-    }
+    /* Allocate packet */
+    tmp_pkt = av_packet_alloc();
+    if (!tmp_pkt)
+        return AVERROR(ENOMEM);
 
     /* Read frame data */
-    ret = av_get_packet(ctx->pb, pkt, s->packet_size);
-    if (ret < 0)
+    ret = av_get_packet(ctx->pb, tmp_pkt, s->packet_size);
+    if (ret < 0) {
+        av_packet_free(&tmp_pkt);
         return ret;
+    }
     if (ret < s->packet_size) {
         av_log(ctx, AV_LOG_ERROR, "Incomplete frame: expected %d bytes, got %d\n",
                s->packet_size, ret);
+        av_packet_free(&tmp_pkt);
         return AVERROR_EOF;
     }
 
-    pkt->pts = pts_us;
-    pkt->dts = pts_us;
-    pkt->stream_index = 0;
+    tmp_pkt->pts = pts_us;
+    tmp_pkt->dts = pts_us;
+    tmp_pkt->stream_index = 0;
 
-    /* Calculate duration for VFR support */
-    if (s->prev_pts != AV_NOPTS_VALUE) {
-        pkt->duration = pts_us - s->prev_pts;
-    } else {
-        /* For the first packet, use framerate as estimate if available */
-        if (s->framerate.num > 0 && s->framerate.den > 0) {
-            pkt->duration = av_rescale_q(1, av_inv_q(s->framerate), (AVRational){1, 1000000});
-        } else {
-            pkt->duration = 0;
-        }
-    }
-
+    /* Buffer this packet and recursively call to get the next one */
+    s->prev_pkt = tmp_pkt;
     s->prev_pts = pts_us;
-    s->first_packet = 0;
 
+    return rawvideots_read_packet(ctx, pkt);
+}
+
+static int rawvideots_read_close(AVFormatContext *ctx)
+{
+    RawVideoTSDemuxerContext *s = ctx->priv_data;
+    av_packet_free(&s->prev_pkt);
     return 0;
 }
 
@@ -167,5 +233,6 @@ const FFInputFormat ff_rawvideo_ts_demuxer = {
     .priv_data_size = sizeof(RawVideoTSDemuxerContext),
     .read_header    = rawvideots_read_header,
     .read_packet    = rawvideots_read_packet,
+    .read_close     = rawvideots_read_close,
     .raw_codec_id   = AV_CODEC_ID_RAWVIDEO,
 };
