@@ -38,6 +38,7 @@ typedef struct RawVideoTSDemuxerContext {
     int packet_size;          /**< Size of a single video frame in bytes */
     AVPacket *prev_pkt;       /**< Buffered previous packet for duration calculation */
     int64_t prev_pts;         /**< Previous frame PTS for duration calculation */
+    int64_t default_duration; /**< Default frame duration in microseconds for last frame */
 } RawVideoTSDemuxerContext;
 
 static int rawvideots_read_header(AVFormatContext *ctx)
@@ -82,9 +83,13 @@ static int rawvideots_read_header(AVFormatContext *ctx)
      * Note: For VFR content, this is only an estimate based on the
      * configured framerate and may not reflect actual bitrate. */
     if (s->framerate.num > 0 && s->framerate.den > 0) {
-        st->codecpar->bit_rate = av_rescale_q(s->packet_size,
-                                           (AVRational){8 * s->framerate.num, s->framerate.den},
+        st->codecpar->bit_rate = av_rescale_q(s->packet_size * 8,
+                                           s->framerate,
                                            (AVRational){1, 1});
+        /* Pre-calculate default duration for last frame */
+        s->default_duration = av_rescale_q(1, av_inv_q(s->framerate), (AVRational){1, 1000000});
+    } else {
+        s->default_duration = 0;
     }
 
     s->prev_pkt = NULL;
@@ -111,9 +116,7 @@ static int rawvideots_read_packet(AVFormatContext *ctx, AVPacket *pkt)
                 /* Error reading next timestamp, return buffered packet with estimated duration */
                 av_packet_move_ref(pkt, s->prev_pkt);
                 av_packet_free(&s->prev_pkt);
-                if (s->framerate.num > 0 && s->framerate.den > 0) {
-                    pkt->duration = av_rescale_q(1, av_inv_q(s->framerate), (AVRational){1, 1000000});
-                }
+                pkt->duration = s->default_duration;
                 /* Return success with buffered packet, not the error */
                 return 0;
             }
@@ -121,9 +124,7 @@ static int rawvideots_read_packet(AVFormatContext *ctx, AVPacket *pkt)
                 /* EOF - return buffered packet with estimated duration */
                 av_packet_move_ref(pkt, s->prev_pkt);
                 av_packet_free(&s->prev_pkt);
-                if (s->framerate.num > 0 && s->framerate.den > 0) {
-                    pkt->duration = av_rescale_q(1, av_inv_q(s->framerate), (AVRational){1, 1000000});
-                }
+                pkt->duration = s->default_duration;
                 return 0;
             }
 
