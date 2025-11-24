@@ -78,7 +78,9 @@ static int rawvideots_read_header(AVFormatContext *ctx)
     if (s->packet_size == 0)
         return AVERROR(EINVAL);
 
-    /* Calculate bit rate based on frame size and framerate */
+    /* Calculate bit rate based on frame size and framerate.
+     * Note: For VFR content, this is only an estimate based on the
+     * configured framerate and may not reflect actual bitrate. */
     if (s->framerate.num > 0 && s->framerate.den > 0) {
         st->codecpar->bit_rate = av_rescale_q(s->packet_size,
                                            (AVRational){8 * s->framerate.num, s->framerate.den},
@@ -99,52 +101,92 @@ static int rawvideots_read_packet(AVFormatContext *ctx, AVPacket *pkt)
     int ret;
     AVPacket *tmp_pkt;
 
-    /* If we have a buffered packet from the previous call, return it now */
-    if (s->prev_pkt) {
-        /* Read the next timestamp to calculate duration for the buffered packet */
+    /* Loop to handle first packet buffering without recursion */
+    while (1) {
+        /* If we have a buffered packet from the previous call, return it now */
+        if (s->prev_pkt) {
+            /* Read the next timestamp to calculate duration for the buffered packet */
+            ret = avio_read(ctx->pb, ts_buf, 8);
+            if (ret < 0) {
+                /* Error reading next timestamp, return buffered packet with estimated duration */
+                av_packet_move_ref(pkt, s->prev_pkt);
+                av_packet_free(&s->prev_pkt);
+                if (s->framerate.num > 0 && s->framerate.den > 0) {
+                    pkt->duration = av_rescale_q(1, av_inv_q(s->framerate), (AVRational){1, 1000000});
+                }
+                /* Return success with buffered packet, not the error */
+                return 0;
+            }
+            if (ret < 8) {
+                /* EOF - return buffered packet with estimated duration */
+                av_packet_move_ref(pkt, s->prev_pkt);
+                av_packet_free(&s->prev_pkt);
+                if (s->framerate.num > 0 && s->framerate.den > 0) {
+                    pkt->duration = av_rescale_q(1, av_inv_q(s->framerate), (AVRational){1, 1000000});
+                }
+                return 0;
+            }
+
+            pts_us = AV_RL64(ts_buf);
+
+            /* Check for non-monotonic or duplicate PTS */
+            if (pts_us <= s->prev_pts) {
+                av_log(ctx, AV_LOG_ERROR, "Non-monotonic or duplicate PTS detected: previous=%"PRId64" current=%"PRId64"\n",
+                       s->prev_pts, pts_us);
+                av_packet_free(&s->prev_pkt);
+                return AVERROR_INVALIDDATA;
+            }
+
+            /* Set duration for buffered packet */
+            s->prev_pkt->duration = pts_us - s->prev_pts;
+
+            /* Return the buffered packet */
+            av_packet_move_ref(pkt, s->prev_pkt);
+
+            /* Allocate new packet for current frame */
+            tmp_pkt = av_packet_alloc();
+            if (!tmp_pkt)
+                return AVERROR(ENOMEM);
+
+            /* Read current frame data */
+            ret = av_get_packet(ctx->pb, tmp_pkt, s->packet_size);
+            if (ret < 0) {
+                av_packet_free(&tmp_pkt);
+                return ret;
+            }
+            if (ret < s->packet_size) {
+                av_log(ctx, AV_LOG_ERROR, "Incomplete frame: expected %d bytes, got %d\n",
+                       s->packet_size, ret);
+                av_packet_free(&tmp_pkt);
+                return AVERROR_EOF;
+            }
+
+            tmp_pkt->pts = pts_us;
+            tmp_pkt->dts = pts_us;
+            tmp_pkt->stream_index = 0;
+
+            /* Store this packet for next call */
+            s->prev_pkt = tmp_pkt;
+            s->prev_pts = pts_us;
+
+            return 0;
+        }
+
+        /* First packet - read and buffer it, then loop to read next */
         ret = avio_read(ctx->pb, ts_buf, 8);
-        if (ret < 0) {
-            /* Error reading next timestamp, return buffered packet with estimated duration */
-            av_packet_move_ref(pkt, s->prev_pkt);
-            av_packet_free(&s->prev_pkt);
-            if (s->framerate.num > 0 && s->framerate.den > 0) {
-                pkt->duration = av_rescale_q(1, av_inv_q(s->framerate), (AVRational){1, 1000000});
-            }
-            /* Return success with buffered packet, not the error */
-            return 0;
-        }
-        if (ret < 8) {
-            /* EOF - return buffered packet with estimated duration */
-            av_packet_move_ref(pkt, s->prev_pkt);
-            av_packet_free(&s->prev_pkt);
-            if (s->framerate.num > 0 && s->framerate.den > 0) {
-                pkt->duration = av_rescale_q(1, av_inv_q(s->framerate), (AVRational){1, 1000000});
-            }
-            return 0;
-        }
+        if (ret < 0)
+            return ret;
+        if (ret < 8)
+            return AVERROR_EOF;
 
         pts_us = AV_RL64(ts_buf);
 
-        /* Check for non-monotonic PTS */
-        if (pts_us < s->prev_pts) {
-            av_log(ctx, AV_LOG_ERROR, "Non-monotonic PTS detected: previous=%"PRId64" current=%"PRId64"\n",
-                   s->prev_pts, pts_us);
-            av_packet_free(&s->prev_pkt);
-            return AVERROR_INVALIDDATA;
-        }
-
-        /* Set duration for buffered packet */
-        s->prev_pkt->duration = pts_us - s->prev_pts;
-
-        /* Return the buffered packet */
-        av_packet_move_ref(pkt, s->prev_pkt);
-
-        /* Allocate new packet for current frame */
+        /* Allocate packet */
         tmp_pkt = av_packet_alloc();
         if (!tmp_pkt)
             return AVERROR(ENOMEM);
 
-        /* Read current frame data */
+        /* Read frame data */
         ret = av_get_packet(ctx->pb, tmp_pkt, s->packet_size);
         if (ret < 0) {
             av_packet_free(&tmp_pkt);
@@ -161,49 +203,11 @@ static int rawvideots_read_packet(AVFormatContext *ctx, AVPacket *pkt)
         tmp_pkt->dts = pts_us;
         tmp_pkt->stream_index = 0;
 
-        /* Store this packet for next call */
+        /* Buffer this packet and loop to read the next one */
         s->prev_pkt = tmp_pkt;
         s->prev_pts = pts_us;
-
-        return 0;
+        /* Continue loop to read next packet */
     }
-
-    /* First packet - just read and buffer it */
-    ret = avio_read(ctx->pb, ts_buf, 8);
-    if (ret < 0)
-        return ret;
-    if (ret < 8)
-        return AVERROR_EOF;
-
-    pts_us = AV_RL64(ts_buf);
-
-    /* Allocate packet */
-    tmp_pkt = av_packet_alloc();
-    if (!tmp_pkt)
-        return AVERROR(ENOMEM);
-
-    /* Read frame data */
-    ret = av_get_packet(ctx->pb, tmp_pkt, s->packet_size);
-    if (ret < 0) {
-        av_packet_free(&tmp_pkt);
-        return ret;
-    }
-    if (ret < s->packet_size) {
-        av_log(ctx, AV_LOG_ERROR, "Incomplete frame: expected %d bytes, got %d\n",
-               s->packet_size, ret);
-        av_packet_free(&tmp_pkt);
-        return AVERROR_EOF;
-    }
-
-    tmp_pkt->pts = pts_us;
-    tmp_pkt->dts = pts_us;
-    tmp_pkt->stream_index = 0;
-
-    /* Buffer this packet and recursively call to get the next one */
-    s->prev_pkt = tmp_pkt;
-    s->prev_pts = pts_us;
-
-    return rawvideots_read_packet(ctx, pkt);
 }
 
 static int rawvideots_read_close(AVFormatContext *ctx)
